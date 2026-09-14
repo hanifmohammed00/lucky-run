@@ -1,0 +1,2 @@
+date,ticker,gap_pct,open_price,avg_volume,gap_rank,signalled,signal_time,signal_multiple,entry_time,filled
+2026-09-04,CURV,13.004482483077092,2.5199999809265137,357775.0,1,True,09:31,18.787371710071735,09:36,True
