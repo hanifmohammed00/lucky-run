@@ -139,7 +139,17 @@ def candidates_on(day: dt.date, daily: dict[str, pd.DataFrame], max_names: int =
     q = df[df.open_price.between(P.price_min, P.price_max)
            & df.gap_pct.between(P.gap_min, P.gap_max, inclusive="left")
            & (df.avg_volume >= 25_000)]
-    q = q[[not _split_between(r.ticker, r.prior_date, day) for r in q.itertuples()]]
+    # a plain list (rather than a Series) is what q[...] wants for boolean
+    # row-selection, but pandas can't tell an EMPTY list of row-bools from an
+    # empty list of column names and picks the latter - on a day with zero
+    # candidates surviving the filters above, that silently drops every
+    # column (prior_date included) instead of every row, and the .drop()
+    # below then KeyErrors on a column that was there a line ago. Wrapping in
+    # a Series (with q's index, and an explicit bool dtype so a zero-length
+    # one isn't inferred as float64/object) keeps it row-selection at any length.
+    not_split = pd.Series([not _split_between(r.ticker, r.prior_date, day) for r in q.itertuples()],
+                          index=q.index, dtype=bool)
+    q = q[not_split]
     return (q.drop(columns=["prior_date"]).sort_values("gap_pct", ascending=False)
             .head(max_names).reset_index(drop=True))
 
