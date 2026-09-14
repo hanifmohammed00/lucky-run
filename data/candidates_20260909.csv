@@ -1,0 +1,3 @@
+date,ticker,gap_pct,open_price,avg_volume,gap_rank,signalled,signal_time,signal_multiple,entry_time,filled
+2026-09-09,MIMI,10.253582603855508,1.0,38953525.0,1,False,,,,False
+2026-09-09,HYFM,9.189186751015292,1.0099999904632568,88150.0,2,False,,,,False

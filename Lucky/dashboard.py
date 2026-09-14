@@ -13,6 +13,11 @@ and a config file, to do what 80 lines already do.
 DRY RUN. "Close" marks the simulated position closed at that minute and the
 end-of-day replay honours it. No broker is connected, so nothing here can
 move real money.
+The dashboard's own "Backfill missed sessions" button (see start_backfill())
+is the exception to read-only: it kicks off Lucky.replay in a background
+thread to fill in weekdays the live runner never ran. It never touches a day
+that already has data - replay.py's own _already_done() guard covers that -
+so the historical record can only grow, never be rewritten.
 """
 
 from __future__ import annotations
@@ -22,6 +27,8 @@ import datetime as dt
 import json
 import logging
 import math
+import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -244,6 +251,153 @@ def _eod_short_state() -> dict | None:
     return state
 
 
+BACKFILL_STATE = DATA_DIR / "backfill_state.json"
+# ADDED 2026-09-13: a day with zero qualifying candidates AND an EOD-short
+# NO_DATA (a real holiday like Labor Day, or just a quiet day - Aug 28 turned
+# out to be the latter, not the unrecoverable case it first looked like)
+# leaves candidates_YYYYMMDD.csv unwritten and no trade_log/eod_short_log
+# row - runner._finish() and replay.replay_day() both skip an empty write on
+# purpose (see their own "if not cands.empty" guards). Without this ledger,
+# such a day would look "missing" forever and the button would re-offer it
+# on every single poll despite a backfill having genuinely checked it.
+# Append-only text, not JSON, so it survives independently of BACKFILL_STATE
+# (which gets fully overwritten every run).
+BACKFILL_CHECKED_EMPTY = DATA_DIR / "backfill_checked_empty.txt"
+_backfill_lock = threading.Lock()
+
+
+def _checked_empty_stamps() -> set[str]:
+    try:
+        return {line.strip() for line in BACKFILL_CHECKED_EMPTY.read_text().splitlines() if line.strip()}
+    except FileNotFoundError:
+        return set()
+
+
+def _mark_checked_empty(stamps: set[str]) -> None:
+    if not stamps:
+        return
+    with BACKFILL_CHECKED_EMPTY.open("a") as f:
+        f.writelines(s + "\n" for s in sorted(stamps))
+
+
+def _existing_stamps() -> set[str]:
+    """YYYYMMDD stamps we already have SOME record for: a candidates file, a
+    probe file (a session that ran but found nothing tradeable), a row in
+    trade_log.csv/eod_short_log.csv, or a day a backfill already confirmed is
+    genuinely empty. Anything not in this set, on a weekday, is a day nothing
+    has ever touched."""
+    stamps = {p.stem.removeprefix("candidates_") for p in DATA_DIR.glob("candidates_*.csv")}
+    stamps |= {p.stem.removeprefix("probe_observations_")
+              for p in DATA_DIR.glob("probe_observations_*.csv")}
+    for name in ("trade_log.csv", "eod_short_log.csv"):
+        path = DATA_DIR / name
+        if not path.exists():
+            continue
+        try:
+            d = pd.read_csv(path, usecols=["date"])
+        except (pd.errors.EmptyDataError, ValueError):
+            continue
+        stamps |= set(pd.to_datetime(d.date).dt.strftime("%Y%m%d"))
+    stamps |= _checked_empty_stamps()
+    return stamps
+
+
+def missing_sessions() -> list[dt.date]:
+    """Weekdays with no record at all, from the earliest stamp on file up to
+    (not including) today. Same 'no holiday calendar' gap as runner.py's
+    _next_open() and replay.py: a real holiday just comes back from
+    replay_day() with zero candidates, which is harmless, not a crash."""
+    stamps = _existing_stamps()
+    if not stamps:
+        return []
+    start = dt.datetime.strptime(min(stamps), "%Y%m%d").date()
+    end = dt.date.today() - dt.timedelta(days=1)
+    out, d = [], start
+    while d <= end:
+        if d.weekday() < 5 and d.strftime("%Y%m%d") not in stamps:
+            out.append(d)
+        d += dt.timedelta(days=1)
+    return out
+
+
+def _write_backfill_state(payload: dict) -> None:
+    try:
+        BACKFILL_STATE.write_text(json.dumps(payload, default=str))
+    except OSError:
+        log.exception("backfill state write failed")
+
+
+def _backfill_state() -> dict | None:
+    try:
+        return json.loads(BACKFILL_STATE.read_text())
+    except (FileNotFoundError, ValueError):
+        return None
+
+
+def _run_backfill(days: list[dt.date]) -> None:
+    """Runs in a background thread - network-bound and can take minutes.
+    Retries the WHOLE range on a rate limit rather than just the one call
+    that hit it: replay.replay_day()'s _already_done() guard makes that safe
+    (a retry just skips every day the first pass already wrote) and simpler
+    than resuming mid-day."""
+    from yfinance.exceptions import YFRateLimitError
+
+    from . import replay
+
+    start, end = min(days), max(days)
+    started = pd.Timestamp.now(tz=ET).isoformat()
+    _write_backfill_state({"status": "running", "range": [str(start), str(end)],
+                          "target_days": len(days), "started": started})
+    for attempt in range(6):
+        try:
+            replay.replay_range(start, end)
+            # anything still unaccounted for after a clean run genuinely had
+            # nothing to log (see BACKFILL_CHECKED_EMPTY above) - not a
+            # failure, just a day worth remembering as "checked"
+            targeted = {d.strftime("%Y%m%d") for d in days}
+            _mark_checked_empty(targeted - _existing_stamps())
+            _write_backfill_state({
+                "status": "done", "range": [str(start), str(end)], "target_days": len(days),
+                "remaining": len(missing_sessions()), "started": started,
+                "finished": pd.Timestamp.now(tz=ET).isoformat()})
+            return
+        except YFRateLimitError:
+            wait = 20 * (attempt + 1)
+            _write_backfill_state({
+                "status": "running", "range": [str(start), str(end)], "target_days": len(days),
+                "started": started, "note": f"rate limited, retrying in {wait}s (attempt {attempt + 1}/6)"})
+            time.sleep(wait)
+        except Exception as exc:
+            log.exception("backfill failed")
+            _write_backfill_state({"status": "error", "error": str(exc), "started": started,
+                                  "finished": pd.Timestamp.now(tz=ET).isoformat()})
+            return
+    _write_backfill_state({"status": "error", "error": "gave up after repeated rate limits",
+                          "started": started, "finished": pd.Timestamp.now(tz=ET).isoformat()})
+
+
+def start_backfill() -> dict:
+    """Kicks off _run_backfill() in a background thread if one isn't already
+    running and there's actually something missing. Returns immediately -
+    progress is read back from BACKFILL_STATE (and from missing_sessions()
+    shrinking as each day is written, since replay writes as it goes)."""
+    if not _backfill_lock.acquire(blocking=False):
+        return {"started": False, "reason": "already running"}
+    days = missing_sessions()
+    if not days:
+        _backfill_lock.release()
+        return {"started": False, "reason": "nothing missing"}
+
+    def _target():
+        try:
+            _run_backfill(days)
+        finally:
+            _backfill_lock.release()
+
+    threading.Thread(target=_target, daemon=True).start()
+    return {"started": True, "days": len(days)}
+
+
 def _records(df: pd.DataFrame) -> list[dict]:
     """Rows as JSON-safe dicts. The frames concatenated in load_trades() have
     different columns, so the gaps come out as NaN - and json.dumps writes
@@ -311,6 +465,9 @@ def build_state() -> dict:
     kill = kill_evaluate(list(real_long.return_pct), KILL_PARAMS)
     kill["n_min"] = KILL_PARAMS.n_min
     eod_short = _eod_short_state()
+
+    def by_side(df: pd.DataFrame, side: str) -> pd.DataFrame:
+        return df[df.side == side] if "side" in df.columns and len(df) else df
     if eod_short:
         # namespaced (see eod_short.INTENT_PREFIX) so this can never collide
         # with a same-day long position's own close/ride intent
@@ -320,10 +477,18 @@ def build_state() -> dict:
             "market_status": _market_status(),
             "intraday_equity": _intraday_equity(),
             "activity": _activity_feed(live, eod_short),
-            "views": {"all": {"stats": summarise(trades), "history": equity_curve(trades)},
-                      "live": {"stats": summarise(real), "history": equity_curve(real)}},
+            "views": {
+                "all": {"stats": summarise(trades), "history": equity_curve(trades),
+                        "long": summarise(by_side(trades, "long")),
+                        "short": summarise(by_side(trades, "short"))},
+                "live": {"stats": summarise(real), "history": equity_curve(real),
+                         "long": summarise(by_side(real, "long")),
+                         "short": summarise(by_side(real, "short"))},
+            },
             "kill_switch": kill,
             "trades": _records(trades),
+            "missing_sessions": [str(d) for d in missing_sessions()],
+            "backfill": _backfill_state(),
             "config": {"account": ACCOUNT_START, "position_size": POSITION_SIZE,
                        "max_deploy_pct": POSITION_SIZE * MAX_FILLS / ACCOUNT_START * 100,
                        "risk_per_stop": POSITION_SIZE * 0.11}}
@@ -367,16 +532,20 @@ class Handler(BaseHTTPRequestHandler):
             self._send(b"not found", "text/plain", 404)
 
     def do_POST(self) -> None:
-        if not self.path.startswith("/api/intent"):
-            return self._send(b"not found", "text/plain", 404)
-        try:
-            payload = json.loads(self.rfile.read(int(self.headers["Content-Length"] or 0)))
-            saved = record_intent(payload["ticker"], payload["action"])
-        except (ValueError, KeyError) as exc:
-            return self._send(json.dumps({"error": str(exc)}).encode(),
-                              "application/json", 400)
-        log.info("intent: %s -> %s", payload["ticker"], payload["action"])
-        self._send(json.dumps(saved).encode(), "application/json")
+        if self.path.startswith("/api/intent"):
+            try:
+                payload = json.loads(self.rfile.read(int(self.headers["Content-Length"] or 0)))
+                saved = record_intent(payload["ticker"], payload["action"])
+            except (ValueError, KeyError) as exc:
+                return self._send(json.dumps({"error": str(exc)}).encode(),
+                                  "application/json", 400)
+            log.info("intent: %s -> %s", payload["ticker"], payload["action"])
+            return self._send(json.dumps(saved).encode(), "application/json")
+        if self.path == "/api/backfill":
+            result = start_backfill()
+            log.info("backfill: %s", result)
+            return self._send(json.dumps(result).encode(), "application/json")
+        self._send(b"not found", "text/plain", 404)
 
     def log_message(self, *args) -> None:
         pass                                  # one user on localhost; the access log is noise
@@ -435,6 +604,14 @@ def _self_check() -> None:
     assert ks["n_min"] == KILL_PARAMS.n_min
     if live_long_n < KILL_PARAMS.n_min:
         assert ks["verdict"] == "TOO_EARLY", ks
+
+    # missing_sessions must only ever name past weekdays - never today/future
+    # (a session in progress isn't "missing") and never a weekend (nothing
+    # runs on one, so it can never be backfilled and must not show as a gap)
+    assert isinstance(state["missing_sessions"], list)
+    for d in missing_sessions():
+        assert d < dt.date.today(), (d, "missing_sessions must not include today or later")
+        assert d.weekday() < 5, (d, "missing_sessions must not include a weekend")
     print("dashboard self-check passed: 5/5")
 
 

@@ -37,11 +37,27 @@ EOD_SHORT_STATE = DATA_DIR / "eod_short_state.json"
 
 
 class Params:
-    def __init__(self, take_profit=40.0, stop_loss=20.0, cover_by="18:00", cost_pct=1.0):
+    def __init__(self, take_profit=40.0, stop_loss=15.0, cover_by="18:00", cost_pct=1.0):
         self.take_profit, self.stop_loss = take_profit, stop_loss
         self.cover_by, self.cost_pct = cover_by, cost_pct
 
 
+# stop_loss CHANGED 2026-09-13 (was 20.0): a post-hoc SL/TP sweep over the
+# only 4 trades with archived post-market bars (INDP/SUNE/TNON/MKDW,
+# 2026-09-08..11 - everything older had already aged out of Yahoo's ~8-day
+# window) found every SL>=15 tied at the same result (+6.84%/trade, 4/4) and
+# every SL<15 caught two of those four (SUNE, TNON) on an intraday spike that
+# later reverted, turning a TIME win into a stop-out. TP was untouched by any
+# level tried 20-80 - none of the 4 ever fell that far - so it stays at its
+# original value on no evidence either way.
+#
+# UNLIKE kill_switch.py's bounds, this was NOT decided before the data
+# existed - it's tuned on the same 4-trade sample it's graded against, which
+# is exactly the failure mode this project's own kill-switch rationale exists
+# to prevent. Kept anyway per an explicit user decision after that caveat was
+# raised (data/eod_short_sl_tp_sweep.csv has the full grid). Revisit once
+# enough new trades exist to check this out-of-sample; don't re-tune it again
+# off a losing stretch without that.
 DEFAULT = Params()
 
 
