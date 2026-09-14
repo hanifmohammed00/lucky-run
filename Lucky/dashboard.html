@@ -217,6 +217,8 @@
   </section>
 
   <section id="tab-pnl" class="hidden">
+    <div class="panel" id="backfill-panel"></div>
+
     <div class="seg">
       <button class="segb sel" data-view="live">Live fills only</button>
       <button class="segb" data-view="all">Include reconstructions</button>
@@ -228,9 +230,21 @@
     <div id="curve"></div>
     <h2>By day</h2>
     <div id="bydays" class="center-table"></div>
-    <h2>All trades</h2>
-    <div class="tablehead center-table" id="trades-head"></div>
-    <div id="trades" class="scrollbox center-table"></div>
+
+    <h2>Long trades</h2>
+    <div class="cards" id="long-stats"></div>
+    <div class="tablehead center-table" id="long-trades-head"></div>
+    <div id="long-trades" class="scrollbox center-table"></div>
+
+    <h2>Short trades</h2>
+    <div class="cards" id="short-stats"></div>
+    <div class="note">Date gaps here (e.g. a day present in Long trades but not here) mean the day was
+      reconstructed too late: Yahoo's free post-market 1-minute data only covers roughly the last 8
+      trading days, so a short that far back can't be verified and is deliberately left unlogged rather
+      than fabricated. The long side doesn't have this problem &mdash; it only needs regular-hours bars,
+      which last longer.</div>
+    <div class="tablehead center-table" id="short-trades-head"></div>
+    <div id="short-trades" class="scrollbox center-table"></div>
   </section>
 
 </div>
@@ -296,6 +310,14 @@ function curve(hist){
 async function intent(ticker, action){
   await fetch("/api/intent",{method:"POST",headers:{"Content-Type":"application/json"},
     body:JSON.stringify({ticker,action})});
+  load();
+}
+
+let backfillStarting = false;
+async function runBackfill(){
+  if (backfillStarting) return;
+  backfillStarting = true;
+  try { await fetch("/api/backfill",{method:"POST"}); } finally { backfillStarting = false; }
   load();
 }
 
@@ -479,6 +501,29 @@ function render(d){
     {h:"Status", f:c=>c.filled?"filled":(c.signalled?"signalled, no fill":"watching"), r:1},
   ], L.candidates||[]);
 
+  // ---- missed-session backfill ----
+  const missing = d.missing_sessions||[];
+  const bf = d.backfill;
+  if (bf && bf.status === "running") {
+    const since = bf.started ? new Date(bf.started).toLocaleTimeString() : "?";
+    $("#backfill-panel").innerHTML = `<h2>Missed sessions</h2>
+      <div class="empty">Backfilling ${bf.target_days} day(s), started ${since}${bf.note?" &mdash; "+bf.note:""}&hellip;</div>`;
+  } else if (missing.length) {
+    const err = bf && bf.status==="error"
+      ? `<div class="note" style="color:var(--down)">Last attempt failed: ${bf.error}</div>` : "";
+    $("#backfill-panel").innerHTML = `<h2>Missed sessions</h2>
+      <div class="note" style="margin-top:0">${missing.length} weekday(s) the runner never ran and nothing has
+        backfilled yet: ${missing.join(", ")}.</div>
+      <button class="act" style="margin:8px 0 0" onclick="runBackfill()">Backfill ${missing.length} missed day(s)</button>
+      ${err}`;
+  } else {
+    const done = bf && bf.status==="done" && bf.finished
+      ? `<div class="note" style="margin-top:0">Last backfill finished ${new Date(bf.finished).toLocaleTimeString()}.</div>` : "";
+    $("#backfill-panel").innerHTML = `<h2>Missed sessions</h2>
+      <div class="note" style="margin-top:0">None &mdash; every weekday since the earliest recorded session has
+        at least a candidate scan, a probe, a logged trade, or a confirmed-empty check on file.</div>${done}`;
+  }
+
   const V = d.views[view], P = V.stats, hist = V.history;
   const tgtGap = P.target_rate==null ? "" : `backtest expects ${P.backtest_target_rate}%`;
   $("#pnl-cards").innerHTML =
@@ -515,20 +560,40 @@ function render(d){
     </div>`;
 
   const tradesCols = [
-    {h:"Date",   w:"12%", f:t=>t.date},
-    {h:"Ticker", w:"11%", f:t=>`<span class="tick">${t.ticker}</span>`},
-    {h:"Side",   w:"9%",  f:t=>t.side},
-    {h:"In",     w:"11%", r:1, f:t=>`<span class="num flat">${t.entry_price!=null?(+t.entry_price).toFixed(4):"&mdash;"}</span>`},
-    {h:"Out",    w:"11%", r:1, f:t=>`<span class="num flat">${t.exit_price!=null?(+t.exit_price).toFixed(4):"&mdash;"}</span>`},
-    {h:"Exit",   w:"10%", r:1, f:t=>t.outcome},
-    {h:"Source", w:"13%", r:1, f:t=>t.source==="live"?(t.is_real?'<b>live · real</b>':'live'):`<span class="flat">${t.source||"live"}</span>`},
-    {h:"Return", w:"11%", r:1, f:t=>sign(t.return_pct,pct)},
-    {h:"P&L",    w:"12%", r:1, f:t=>sign(t.pnl,money)},
+    {h:"Date",   w:"13%", f:t=>t.date},
+    {h:"Ticker", w:"13%", f:t=>`<span class="tick">${t.ticker}</span>`},
+    {h:"In",     w:"12%", r:1, f:t=>`<span class="num flat">${t.entry_price!=null?(+t.entry_price).toFixed(4):"&mdash;"}</span>`},
+    {h:"Out",    w:"12%", r:1, f:t=>`<span class="num flat">${t.exit_price!=null?(+t.exit_price).toFixed(4):"&mdash;"}</span>`},
+    {h:"Exit",   w:"11%", r:1, f:t=>t.outcome},
+    {h:"Source", w:"14%", r:1, f:t=>t.source==="live"?(t.is_real?'<b>live · real</b>':'live'):`<span class="flat">${t.source||"live"}</span>`},
+    {h:"Return", w:"12%", r:1, f:t=>sign(t.return_pct,pct)},
+    {h:"P&L",    w:"13%", r:1, f:t=>sign(t.pnl,money)},
   ];
-  const tradesSplit = tableSplit(tradesCols, [...d.trades].reverse());
-  // always all of them, labelled by Source - the toggle above only changes what feeds the cards/equity
-  $("#trades-head").innerHTML = tradesSplit.headHtml;
-  $("#trades").innerHTML = tradesSplit.bodyHtml;
+  // stats cards for a side: same shape as the strategy-level pnl-cards above,
+  // minus target-rate (a TP-hit-rate against a long-only backtest - always
+  // reads 0% on the short side, which isn't "0% on target", it's "not a
+  // concept here")
+  function sideStats(S){
+    return card("Trades", S.trades, "") +
+      card("Win rate", S.win_rate==null?"—":S.win_rate.toFixed(0)+"%", "") +
+      card("Avg / trade", S.avg_pct==null?"—":`<span class="${cls(S.avg_pct)}">${pct(S.avg_pct)}</span>`, "") +
+      card("Best", S.best==null?"—":`<span class="up">${pct(S.best)}</span>`, "") +
+      card("Worst", S.worst==null?"—":`<span class="down">${pct(S.worst)}</span>`, "");
+  }
+
+  // always ALL trades of that side, labelled by Source - the live/all toggle
+  // above only changes what the stats cards and equity/by-day are computed over
+  const allSideTrades = side => [...d.trades].reverse().filter(t=>t.side===side);
+
+  $("#long-stats").innerHTML = sideStats(V.long);
+  const longSplit = tableSplit(tradesCols, allSideTrades("long"));
+  $("#long-trades-head").innerHTML = longSplit.headHtml;
+  $("#long-trades").innerHTML = longSplit.bodyHtml;
+
+  $("#short-stats").innerHTML = sideStats(V.short);
+  const shortSplit = tableSplit(tradesCols, allSideTrades("short"));
+  $("#short-trades-head").innerHTML = shortSplit.headHtml;
+  $("#short-trades").innerHTML = shortSplit.bodyHtml;
 }
 
 function load(){

@@ -11,3 +11,5 @@ data/live_state.json
 data/eod_short_state.json
 data/intents.json
 data/equity_intraday_*.csv
+data/backfill_state.json
+data/backfill_checked_empty.txt
